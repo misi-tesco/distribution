@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"github.com/distribution/distribution/v3/registry/storage"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"sync"
@@ -24,11 +26,18 @@ type proxyBlobStore struct {
 
 var _ distribution.BlobStore = &proxyBlobStore{}
 
+type InFlight struct {
+	downloading    bool
+	lastError      error
+	readableWriter storage.ReadableWriter
+}
+
 // inflight tracks currently downloading blobs
-var inflight = make(map[digest.Digest]struct{})
+var inflight = make(map[digest.Digest]*InFlight)
 
 // mu protects inflight
 var mu sync.Mutex
+var cond = sync.NewCond(&mu)
 
 func setResponseHeaders(w http.ResponseWriter, length int64, mediaType string, digest digest.Digest) {
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
@@ -76,24 +85,32 @@ func (pbs *proxyBlobStore) serveLocal(ctx context.Context, w http.ResponseWriter
 	return true, pbs.localStore.ServeBlob(ctx, w, r, dgst)
 }
 
-func (pbs *proxyBlobStore) storeLocal(ctx context.Context, dgst digest.Digest) error {
-	defer func() {
-		mu.Lock()
-		delete(inflight, dgst)
-		mu.Unlock()
-	}()
-
-	var desc distribution.Descriptor
-	var err error
-	var bw distribution.BlobWriter
-
-	bw, err = pbs.localStore.Create(ctx)
+func (pbs *proxyBlobStore) doServeFromLocalStore(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
+	log.Printf("Serving %s from local storage, repo: %s", dgst, pbs.repositoryName)
+	_, err := pbs.localStore.Stat(ctx, dgst)
 	if err != nil {
 		return err
 	}
 
+	//proxyMetrics.BlobServe(uint64(localDesc.Size))
+	return pbs.localStore.ServeBlob(ctx, w, r, dgst)
+
+}
+
+func (pbs *proxyBlobStore) IsPresentLocally(ctx context.Context, dgst digest.Digest) bool {
+	_, err := pbs.localStore.Stat(ctx, dgst)
+	// Stat can report a zero sized file here if it's checked between creation
+	// and population.  Return nil error, and continue
+	return err == nil
+}
+
+func (pbs *proxyBlobStore) storeLocal(ctx context.Context, dgst digest.Digest, bw distribution.BlobWriter) error {
+	var desc distribution.Descriptor
+	var err error
+
 	desc, err = pbs.copyContent(ctx, dgst, bw)
 	if err != nil {
+		bw.Cancel(ctx)
 		return err
 	}
 
@@ -105,50 +122,130 @@ func (pbs *proxyBlobStore) storeLocal(ctx context.Context, dgst digest.Digest) e
 	return nil
 }
 
-func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
-	served, err := pbs.serveLocal(ctx, w, r, dgst)
-	if err != nil {
-		dcontext.GetLogger(ctx).Errorf("Error serving blob from local storage: %s", err.Error())
-		return err
-	}
-
-	if served {
-		return nil
-	}
+func (pbs *proxyBlobStore) FetchFromRemote(dgst digest.Digest, ctx context.Context, bw *distribution.BlobWriter) {
+	defer func() {
+		mu.Lock()
+		inflight[dgst].downloading = false
+		cond.Broadcast()
+		mu.Unlock()
+	}()
 
 	if err := pbs.authChallenger.tryEstablishChallenges(ctx); err != nil {
-		return err
+		inflight[dgst].lastError = err
+		return
+	}
+
+	//err := pbs.storeLocal(ctx, dgst, bw)
+
+	desc, err := pbs.copyContent(ctx, dgst, *bw)
+	if err != nil {
+		(*bw).Cancel(ctx)
+		dcontext.GetLogger(ctx).Errorf("Error copying to storage: %s", err.Error())
+		inflight[dgst].lastError = err
+		return
 	}
 
 	mu.Lock()
-	_, ok := inflight[dgst]
-	if ok {
-		mu.Unlock()
-		_, err := pbs.copyContent(ctx, dgst, w)
-		return err
-	}
-	inflight[dgst] = struct{}{}
+	_, err = (*bw).Commit(ctx, desc)
 	mu.Unlock()
+	if err != nil {
+		inflight[dgst].lastError = err
+		dcontext.GetLogger(ctx).Errorf("Error committing to storage: %s", err.Error())
+		return
+	}
 
-	go func(dgst digest.Digest) {
-		if err := pbs.storeLocal(ctx, dgst); err != nil {
-			dcontext.GetLogger(ctx).Errorf("Error committing to storage: %s", err.Error())
+	blobRef, err := reference.WithDigest(pbs.repositoryName, dgst)
+	if err != nil {
+		inflight[dgst].lastError = err
+		dcontext.GetLogger(ctx).Errorf("Error creating reference: %s", err)
+		return
+	}
+
+	pbs.scheduler.AddBlob(blobRef, repositoryTTL)
+}
+
+func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
+	mu.Lock()
+	infl, ok := inflight[dgst]
+	isPresent := pbs.IsPresentLocally(ctx, dgst)
+	log.Printf("digest %s present: %t, in flight: %t, in flight object: %v", dgst, isPresent, ok, infl)
+	isNew := !isPresent && (!ok || infl.downloading == false)
+	if isNew {
+		if !ok {
+			infl = &InFlight{
+				lastError: nil,
+			}
+			inflight[dgst] = infl
 		}
-
-		blobRef, err := reference.WithDigest(pbs.repositoryName, dgst)
+		infl.downloading = true
+		bw, err := pbs.localStore.Create(ctx)
 		if err != nil {
-			dcontext.GetLogger(ctx).Errorf("Error creating reference: %s", err)
-			return
+			mu.Unlock()
+			return err
 		}
+		rw, ok := bw.(storage.ReadableWriter)
+		if ok {
+			infl.readableWriter = rw
+		}
+		go pbs.FetchFromRemote(dgst, ctx, &bw)
+	}
 
-		pbs.scheduler.AddBlob(blobRef, repositoryTTL)
-	}(dgst)
+	inflightReader := io.ReadCloser(nil)
+	var err error
+	if infl != nil && infl.downloading && infl.readableWriter != nil {
+		inflightReader, err = infl.readableWriter.Reader()
+	}
 
-	_, err = pbs.copyContent(ctx, dgst, w)
+	mu.Unlock()
 	if err != nil {
 		return err
 	}
-	return nil
+	if inflightReader != nil {
+		size, err := io.Copy(w, inflightReader)
+		if err != nil {
+			return err
+		}
+		desc, err := pbs.localStore.Stat(ctx, dgst)
+		if err != nil {
+			return err
+		}
+		if desc.Size != size {
+			return io.EOF
+		}
+		return nil
+	}
+
+	for isDownloading := infl != nil && infl.downloading; isDownloading && !isPresent; {
+		log.Printf("Waiting for background download to finish for %s ..", dgst)
+		cond.Wait()
+		isPresent = pbs.IsPresentLocally(ctx, dgst)
+		isDownloading = infl != nil && infl.downloading
+	}
+
+	var lastError error = nil
+	if infl != nil {
+		lastError = infl.lastError
+	}
+
+	if isPresent {
+		err := pbs.doServeFromLocalStore(ctx, w, r, dgst)
+		if err != nil {
+			dcontext.GetLogger(ctx).Errorf("Error serving blob from local storage: %s", err.Error())
+			return err
+		}
+		if !isNew {
+			//proxyMetrics.BlobHits()
+		}
+		log.Printf("Served %s from local storage, repo: %s", dgst, pbs.repositoryName)
+		log.Printf("Sum of pushed data is %d", proxyMetrics.blobMetrics.BytesPushed)
+		return nil
+	}
+	if lastError != nil {
+		return lastError
+	} else {
+		log.Printf("the requested blob %s is not found, repo: %s", dgst, pbs.repositoryName)
+		return distribution.ErrBlobUnknown
+	}
 }
 
 func (pbs *proxyBlobStore) Stat(ctx context.Context, dgst digest.Digest) (distribution.Descriptor, error) {
