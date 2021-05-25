@@ -432,12 +432,14 @@ type blobWriterPipe struct {
 func (pipe *blobWriterPipe) Read(buff []byte) (int, error) {
 	logrus.Infof("Reading ...")
 	pipe.blobWriter.mutex.Lock()
+	inProgress := pipe.blobWriter.IsInProgress()
 	logrus.Infof("Reading locked ...")
 	defer pipe.blobWriter.mutex.Unlock()
 	defer logrus.Infof("Reading unlocked ...")
 	for true {
 		wait := false
 		pipe.blobWriter.mutex.Unlock()
+		logrus.Info("Reading from filestream ...")
 		count, err := pipe.reader.Read(buff)
 		logrus.Infof("Read from filestream: %d, %s", count, err)
 		pipe.blobWriter.mutex.Lock()
@@ -445,17 +447,19 @@ func (pipe *blobWriterPipe) Read(buff []byte) (int, error) {
 			return count, nil
 		}
 		if err == io.EOF {
-			if pipe.blobWriter.IsInProgress() {
+			if inProgress {
 				wait = true
 			} else {
 				toReturn := io.EOF
-				if pipe.blobWriter.lastError != nil {
+				if count != 0 {
+					toReturn = nil // If
+				} else if pipe.blobWriter.lastError != nil {
 					toReturn = pipe.blobWriter.lastError
 				}
 				return count, toReturn
 			}
 		}
-		if err == io.EOF && pipe.blobWriter.IsInProgress() {
+		if err == io.EOF && inProgress {
 			wait = true
 		}
 		if err != nil && err != io.EOF {

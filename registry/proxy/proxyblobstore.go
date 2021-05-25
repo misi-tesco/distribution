@@ -207,6 +207,7 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 			return err
 		}
 		if desc.Size != size {
+			log.Printf("Size did not match for %s. Expected: %d, downloaded: %d", dgst, desc.Size, size)
 			return io.EOF
 		}
 		return nil
