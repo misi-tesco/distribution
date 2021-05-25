@@ -307,7 +307,8 @@ func (d *driver) Watch(ctx context.Context, paths ...string) (io.Closer, chan fs
 		return nil, nil, err
 	}
 	for _, p := range paths {
-		if err = watcher.Add(d.fullPath(p)); err != nil {
+		fullPath := d.fullPath(p)
+		if err = watcher.Add(fullPath); err != nil {
 			return nil, nil, err
 		}
 	}

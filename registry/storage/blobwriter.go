@@ -48,6 +48,7 @@ type blobWriter struct {
 	mutex                  *sync.Mutex
 	finished               chan struct{}
 	refCount               int32
+	lastError              error
 }
 
 var _ distribution.BlobWriter = &blobWriter{}
@@ -65,8 +66,16 @@ func (bw *blobWriter) StartedAt() time.Time {
 // final size and digest are checked against the first descriptor provided.
 func (bw *blobWriter) Commit(ctx context.Context, desc distribution.Descriptor) (distribution.Descriptor, error) {
 	bw.mutex.Lock()
-	defer bw.mutex.Unlock()
 	defer close(bw.finished)
+	defer bw.mutex.Unlock()
+	res, err := bw.doCommit(ctx, desc)
+	if err != nil {
+		bw.lastError = err
+	}
+	return res, err
+}
+
+func (bw *blobWriter) doCommit(ctx context.Context, desc distribution.Descriptor) (distribution.Descriptor, error) {
 	dcontext.GetLogger(ctx).Debug("(*blobWriter).Commit")
 
 	if err := bw.fileWriter.Commit(); err != nil {
@@ -85,6 +94,7 @@ func (bw *blobWriter) Commit(ctx context.Context, desc distribution.Descriptor) 
 		return distribution.Descriptor{}, err
 	}
 
+	logrus.Info("Moved")
 	if err := bw.blobStore.linkBlob(ctx, canonical, desc.Digest); err != nil {
 		return distribution.Descriptor{}, err
 	}
@@ -99,6 +109,7 @@ func (bw *blobWriter) Commit(ctx context.Context, desc distribution.Descriptor) 
 	}
 
 	bw.committed = true
+	logrus.Info("Committed")
 
 	return canonical, nil
 }
@@ -106,6 +117,10 @@ func (bw *blobWriter) Commit(ctx context.Context, desc distribution.Descriptor) 
 // Cancel the blob upload process, releasing any resources associated with
 // the writer and canceling the operation.
 func (bw *blobWriter) Cancel(ctx context.Context) error {
+	bw.mutex.Lock()
+	defer bw.mutex.Unlock()
+	defer close(bw.finished)
+
 	bw.cancelled = true
 	dcontext.GetLogger(ctx).Debug("(*blobWriter).Cancel")
 	if err := bw.fileWriter.Cancel(); err != nil {
@@ -116,7 +131,12 @@ func (bw *blobWriter) Cancel(ctx context.Context) error {
 		dcontext.GetLogger(ctx).Errorf("error closing blobwriter: %s", err)
 	}
 
-	return bw.removeResources(ctx)
+	return bw.ReleaseResources()
+}
+
+func (bw *blobWriter) CancelWithError(ctx context.Context, err error) error {
+	bw.lastError = err
+	return bw.Cancel(ctx)
 }
 
 func (bw *blobWriter) Size() int64 {
@@ -410,41 +430,38 @@ type blobWriterPipe struct {
 }
 
 func (pipe *blobWriterPipe) Read(buff []byte) (int, error) {
+	logrus.Infof("Reading ...")
 	pipe.blobWriter.mutex.Lock()
+	logrus.Infof("Reading locked ...")
 	defer pipe.blobWriter.mutex.Unlock()
+	defer logrus.Infof("Reading unlocked ...")
 	for true {
 		wait := false
-		if pipe.reader == nil {
-			reader, err := pipe.driver.Reader(pipe.ctx, pipe.path, 0)
-			pipe.reader = reader
-			_, ok := err.(*storagedriver.PathNotFoundError)
-			if ok {
-				wait = true
-			}
-
+		pipe.blobWriter.mutex.Unlock()
+		count, err := pipe.reader.Read(buff)
+		logrus.Infof("Read from filestream: %d, %s", count, err)
+		pipe.blobWriter.mutex.Lock()
+		if count != 0 && (err == nil || err == io.EOF) {
+			return count, nil
 		}
-		if pipe.reader != nil {
-			reader := pipe.reader
-			pipe.blobWriter.mutex.Unlock()
-			count, err := reader.Read(buff)
-			pipe.blobWriter.mutex.Lock()
-			if count != 0 && (err == nil || err == io.EOF) {
-				return count, nil
-			}
-			if err == io.EOF {
-				if pipe.blobWriter.IsInProgress() {
-					wait = true
-				} else {
-					return count, io.EOF
+		if err == io.EOF {
+			if pipe.blobWriter.IsInProgress() {
+				wait = true
+			} else {
+				toReturn := io.EOF
+				if pipe.blobWriter.lastError != nil {
+					toReturn = pipe.blobWriter.lastError
 				}
-			}
-			if err == io.EOF && pipe.blobWriter.IsInProgress() {
-				wait = true
-			}
-			if err != nil && err != io.EOF {
-				return count, err
+				return count, toReturn
 			}
 		}
+		if err == io.EOF && pipe.blobWriter.IsInProgress() {
+			wait = true
+		}
+		if err != nil && err != io.EOF {
+			return count, err
+		}
+		logrus.Infof("To wait: %s", wait)
 		pipe.blobWriter.mutex.Unlock()
 		if wait {
 			select {
@@ -458,6 +475,7 @@ func (pipe *blobWriterPipe) Read(buff []byte) (int, error) {
 		}
 		pipe.blobWriter.mutex.Lock()
 	}
+	logrus.Print("Returning 0+EOF ...")
 	return 0, io.EOF
 
 }
@@ -472,6 +490,9 @@ var _ ReadableWriter = &blobWriter{}
 type ReadableWriter interface {
 	distribution.BlobWriter
 	Reader() (io.ReadCloser, error)
+
+	// CancelWithError does the same as Cancel plus delegates the error to any readers that are reading the writer
+	CancelWithError(ctx context.Context, err error) error
 }
 
 func (bw *blobWriter) IsInProgress() bool {
@@ -490,6 +511,10 @@ func (bw *blobWriter) Reader() (io.ReadCloser, error) {
 		return nil, err
 	}
 
+	reader, err := bw.driver.Reader(bw.ctx, bw.path, 0)
+	if err != nil {
+		return nil, err
+	}
 	pipe := blobWriterPipe{
 		driver:     bw.driver,
 		ctx:        bw.ctx,
@@ -498,6 +523,7 @@ func (bw *blobWriter) Reader() (io.ReadCloser, error) {
 		watcher:    watcher,
 		finished:   bw.finished,
 		events:     events,
+		reader:     reader,
 	}
 
 	return &pipe, nil

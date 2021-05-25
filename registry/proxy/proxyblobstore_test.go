@@ -310,6 +310,17 @@ func TestProxyStoreServeMany(t *testing.T) {
 	testProxyStoreServe(t, te, numClients)
 }
 
+func TestProxyStoreServeSingle(t *testing.T) {
+	te := makeTestEnv(t, "foo/bar")
+	blobSize := 200
+	blobCount := 1
+	numUnique := 1
+	populate(t, te, blobCount, blobSize, numUnique)
+
+	numClients := 1
+	testProxyStoreServe(t, te, numClients)
+}
+
 // todo(richardscothern): blobCount must be smaller than num clients
 func TestProxyStoreServeBig(t *testing.T) {
 	te := makeTestEnv(t, "foo/bar")
@@ -321,6 +332,25 @@ func TestProxyStoreServeBig(t *testing.T) {
 
 	numClients := 4
 	testProxyStoreServe(t, te, numClients)
+}
+
+func TestProxyStoreServeNotFound(t *testing.T) {
+	te := makeTestEnv(t, "foo/bar")
+	blobSize := 200
+	blobCount := 10
+	numUnique := 4
+	populate(t, te, blobCount, blobSize, numUnique)
+
+	w := httptest.NewRecorder()
+	r, err := http.NewRequest("GET", "", nil)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	err = te.store.ServeBlob(te.ctx, w, r, "sha256:1234567890123456789012345678901234567890123456789012345678901234")
+	if err != distribution.ErrBlobUnknown {
+		t.Fatalf("Not found expected, got: %v", err)
+	}
 }
 
 // testProxyStoreServe will create clients to consume all blobs
