@@ -841,7 +841,7 @@ func (d *driver) Walk(ctx context.Context, path string, f storagedriver.WalkFn) 
 }
 
 func (d *driver) Watch(ctx context.Context, paths ...string) (io.Closer, chan fsnotify.Event, error) {
-	return nil, nil, fmt.Errorf("NOT IMPLEMENTED")
+	return nil, nil, storagedriver.ErrUnsupportedMethod{}
 }
 
 func startSession(client *http.Client, bucket string, name string) (uri string, err error) {

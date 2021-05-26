@@ -5,7 +5,6 @@ import (
 	"errors"
 	"github.com/distribution/distribution/v3/registry/storage"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"sync"
@@ -96,13 +95,11 @@ func (pbs *proxyBlobStore) serveLocal(ctx context.Context, w http.ResponseWriter
 }
 
 func (pbs *proxyBlobStore) doServeFromLocalStore(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
-	log.Printf("Serving %s from local storage, repo: %s", dgst, pbs.repositoryName)
 	_, err := pbs.localStore.Stat(ctx, dgst)
 	if err != nil {
 		return err
 	}
 
-	//proxyMetrics.BlobServe(uint64(localDesc.Size))
 	return pbs.localStore.ServeBlob(ctx, w, r, dgst)
 
 }
@@ -117,13 +114,12 @@ func (pbs *proxyBlobStore) IsPresentLocally(ctx context.Context, dgst digest.Dig
 func (pbs *proxyBlobStore) fetchFromRemote(dgst digest.Digest, ctx context.Context, fetcher *BlobFetch) {
 	err := pbs.doFetchFromRemote(dgst, ctx, fetcher.readableWriter)
 	if err != nil {
-		log.Printf("Failed to fetch layer %s, error: %s", dgst, err)
+		dcontext.GetLogger(ctx).Errorf("Failed to fetch layer %s, error: %s", dgst, err)
 	}
 }
 
 func (pbs *proxyBlobStore) doFetchFromRemote(dgst digest.Digest, ctx context.Context, bw storage.ReadableWriter) error {
 	if err := pbs.authChallenger.tryEstablishChallenges(ctx); err != nil {
-
 		bw.CancelWithError(ctx, err)
 		return err
 	}
@@ -134,7 +130,7 @@ func (pbs *proxyBlobStore) doFetchFromRemote(dgst digest.Digest, ctx context.Con
 	defer mu.Unlock()
 	if err != nil {
 		bw.CancelWithError(ctx, err)
-		dcontext.GetLogger(ctx).Errorf(" Error copying to storage: %s", err.Error())
+		dcontext.GetLogger(ctx).Errorf("Error copying to storage: %s", err.Error())
 		return err
 	}
 
@@ -156,33 +152,31 @@ func (pbs *proxyBlobStore) doFetchFromRemote(dgst digest.Digest, ctx context.Con
 
 func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
 	mu.Lock()
-	infl, ok := inflight[dgst]
+	fetch, ok := inflight[dgst]
 	isPresent := pbs.IsPresentLocally(ctx, dgst)
-	log.Printf("digest %s present: %t, in flight: %t, in flight object: %v", dgst, isPresent, ok, infl)
+
+	dcontext.GetLogger(ctx).Debugf("digest %s present: %t, in flight: %t, in flight object: %v", dgst, isPresent, ok, fetch)
 	isNew := !isPresent && !ok
 	if isNew {
-		bw, err := pbs.localStore.Create(ctx)
+		writer, err := pbs.localStore.Create(ctx)
 		if err != nil {
 			mu.Unlock()
 			return err
 		}
-		rw, _ := bw.(storage.ReadableWriter)
-		infl = newBlobFetch(rw)
-		inflight[dgst] = infl
-		go pbs.fetchFromRemote(dgst, ctx, infl)
+		rWriter, _ := writer.(storage.ReadableWriter)
+		fetch = newBlobFetch(rWriter)
+		inflight[dgst] = fetch
+		go pbs.fetchFromRemote(dgst, ctx, fetch)
 	}
 
 	inflightReader := io.ReadCloser(nil)
 	var err error
-	if infl != nil {
-		inflightReader, err = infl.readableWriter.Reader()
+	if fetch != nil {
+		inflightReader, err = fetch.readableWriter.Reader()
 	}
 	mu.Unlock()
 	if err != nil {
 		return err
-	}
-	if !isNew {
-		//proxyMetrics.BlobHits()
 	}
 	if isPresent {
 		err := pbs.doServeFromLocalStore(ctx, w, r, dgst)
@@ -190,9 +184,7 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 			dcontext.GetLogger(ctx).Errorf("Error serving blob from local storage: %s", err.Error())
 			return err
 		}
-		log.Printf("Served %s from local storage, repo: %s", dgst, pbs.repositoryName)
-		log.Printf("Sum of pushed data is %d", proxyMetrics.blobMetrics.BytesPushed)
-		return nil
+		dcontext.GetLogger(ctx).Debugf("Served %s from local storage, repo: %s", dgst, pbs.repositoryName)
 	} else {
 		if inflightReader == nil {
 			// this should not be reached, local stream should always be readable
@@ -200,7 +192,7 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 		}
 		size, err := io.Copy(w, inflightReader)
 		if err != nil {
-			log.Printf("Error occurred while fetching from in-flight reader: %s", err)
+			dcontext.GetLogger(ctx).Errorf("Error occurred while fetching from in-flight reader: %s", err)
 			return err
 		}
 		desc, err := pbs.localStore.Stat(ctx, dgst)
@@ -208,11 +200,11 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 			return err
 		}
 		if desc.Size != size {
-			log.Printf("Size did not match for %s. Expected: %d, downloaded: %d", dgst, desc.Size, size)
+			dcontext.GetLogger(ctx).Errorf("Size did not match for %s. Expected: %d, downloaded: %d", dgst, desc.Size, size)
 			return io.EOF
 		}
-		return nil
 	}
+	return nil
 }
 
 func (pbs *proxyBlobStore) Stat(ctx context.Context, dgst digest.Digest) (distribution.Descriptor, error) {

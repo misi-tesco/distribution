@@ -310,17 +310,6 @@ func TestProxyStoreServeMany(t *testing.T) {
 	testProxyStoreServe(t, te, numClients)
 }
 
-func TestProxyStoreServeSingle(t *testing.T) {
-	te := makeTestEnv(t, "foo/bar")
-	blobSize := 200
-	blobCount := 1
-	numUnique := 1
-	populate(t, te, blobCount, blobSize, numUnique)
-
-	numClients := 1
-	testProxyStoreServe(t, te, numClients)
-}
-
 // todo(richardscothern): blobCount must be smaller than num clients
 func TestProxyStoreServeBig(t *testing.T) {
 	te := makeTestEnv(t, "foo/bar")

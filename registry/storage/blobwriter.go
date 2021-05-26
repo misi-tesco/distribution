@@ -94,7 +94,6 @@ func (bw *blobWriter) doCommit(ctx context.Context, desc distribution.Descriptor
 		return distribution.Descriptor{}, err
 	}
 
-	logrus.Info("Moved")
 	if err := bw.blobStore.linkBlob(ctx, canonical, desc.Digest); err != nil {
 		return distribution.Descriptor{}, err
 	}
@@ -109,7 +108,6 @@ func (bw *blobWriter) doCommit(ctx context.Context, desc distribution.Descriptor
 	}
 
 	bw.committed = true
-	logrus.Info("Committed")
 
 	return canonical, nil
 }
@@ -418,7 +416,7 @@ func (bw *blobWriter) removeResources(ctx context.Context) error {
 	return nil
 }
 
-type blobWriterPipe struct {
+type blobWriterReader struct {
 	path       string
 	events     chan fsnotify.Event
 	blobWriter *blobWriter
@@ -429,66 +427,46 @@ type blobWriterPipe struct {
 	finished   chan struct{}
 }
 
-func (pipe *blobWriterPipe) Read(buff []byte) (int, error) {
-	logrus.Infof("Reading ...")
-	pipe.blobWriter.mutex.Lock()
-	inProgress := pipe.blobWriter.IsInProgress()
-	logrus.Infof("Reading locked ...")
-	defer pipe.blobWriter.mutex.Unlock()
-	defer logrus.Infof("Reading unlocked ...")
+func (reader *blobWriterReader) Read(buff []byte) (int, error) {
+	reader.blobWriter.mutex.Lock()
+	inProgress := reader.blobWriter.IsInProgress()
+	defer reader.blobWriter.mutex.Unlock()
 	for true {
-		wait := false
-		pipe.blobWriter.mutex.Unlock()
-		logrus.Info("Reading from filestream ...")
-		count, err := pipe.reader.Read(buff)
-		logrus.Infof("Read from filestream: %d, %s", count, err)
-		pipe.blobWriter.mutex.Lock()
-		if count != 0 && (err == nil || err == io.EOF) {
-			return count, nil
-		}
-		if err == io.EOF {
-			if inProgress {
-				wait = true
-			} else {
-				toReturn := io.EOF
-				if count != 0 {
-					toReturn = nil // If
-				} else if pipe.blobWriter.lastError != nil {
-					toReturn = pipe.blobWriter.lastError
-				}
-				return count, toReturn
-			}
-		}
-		if err == io.EOF && inProgress {
-			wait = true
-		}
+		reader.blobWriter.mutex.Unlock()
+		count, err := reader.reader.Read(buff)
+		reader.blobWriter.mutex.Lock()
 		if err != nil && err != io.EOF {
 			return count, err
 		}
-		logrus.Infof("To wait: %s", wait)
-		pipe.blobWriter.mutex.Unlock()
-		if wait {
+		if count != 0 && (err == nil || err == io.EOF) {
+			return count, nil
+		}
+		if err == io.EOF && !inProgress {
+			if reader.blobWriter.lastError != nil {
+				err = reader.blobWriter.lastError
+			}
+			return count, err
+		}
+		reader.blobWriter.mutex.Unlock()
+		if inProgress {
 			select {
-			case event := <-pipe.events:
-				logrus.Infof("Event received %v", event)
-			case <-pipe.finished:
-				logrus.Info("Finished event received")
-			case <-time.After(5 * time.Second):
-				logrus.Info("Should have received event")
+			case <-reader.events:
+			case <-reader.finished:
+			case <-time.After(60 * time.Second):
+				logrus.Debugf("Timed out waiting for events ...")
 			}
 		}
-		pipe.blobWriter.mutex.Lock()
+		reader.blobWriter.mutex.Lock()
 	}
-	logrus.Print("Returning 0+EOF ...")
 	return 0, io.EOF
 
 }
 
-func (pipe *blobWriterPipe) Close() error {
-	return pipe.blobWriter.ReleaseResources()
+func (reader *blobWriterReader) Close() error {
+	return reader.blobWriter.ReleaseResources()
 }
 
-var _ io.ReadCloser = &blobWriterPipe{}
+var _ io.ReadCloser = &blobWriterReader{}
 var _ ReadableWriter = &blobWriter{}
 
 type ReadableWriter interface {
@@ -519,7 +497,7 @@ func (bw *blobWriter) Reader() (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	pipe := blobWriterPipe{
+	wReader := blobWriterReader{
 		driver:     bw.driver,
 		ctx:        bw.ctx,
 		path:       bw.path,
@@ -530,5 +508,5 @@ func (bw *blobWriter) Reader() (io.ReadCloser, error) {
 		reader:     reader,
 	}
 
-	return &pipe, nil
+	return &wReader, nil
 }
