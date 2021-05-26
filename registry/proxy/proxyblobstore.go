@@ -30,11 +30,11 @@ var _ distribution.BlobStore = &proxyBlobStore{}
 type BlobFetch struct {
 	complete       bool
 	completeCond   *sync.Cond
-	readableWriter *storage.ReadableWriter
+	readableWriter storage.ReadableWriter
 	mutex          sync.Mutex
 }
 
-func NewBlobFetch(w *storage.ReadableWriter) *BlobFetch {
+func newBlobFetch(w storage.ReadableWriter) *BlobFetch {
 	res := &BlobFetch{
 		readableWriter: w,
 	}
@@ -114,30 +114,31 @@ func (pbs *proxyBlobStore) IsPresentLocally(ctx context.Context, dgst digest.Dig
 	return err == nil
 }
 
-func (pbs *proxyBlobStore) FetchFromRemote(dgst digest.Digest, ctx context.Context, fetcher *BlobFetch) {
+func (pbs *proxyBlobStore) fetchFromRemote(dgst digest.Digest, ctx context.Context, fetcher *BlobFetch) {
 	err := pbs.doFetchFromRemote(dgst, ctx, fetcher.readableWriter)
 	if err != nil {
 		log.Printf("Failed to fetch layer %s, error: %s", dgst, err)
 	}
 }
 
-func (pbs *proxyBlobStore) doFetchFromRemote(dgst digest.Digest, ctx context.Context, bw *storage.ReadableWriter) error {
+func (pbs *proxyBlobStore) doFetchFromRemote(dgst digest.Digest, ctx context.Context, bw storage.ReadableWriter) error {
 	if err := pbs.authChallenger.tryEstablishChallenges(ctx); err != nil {
-		(*bw).CancelWithError(ctx, err)
+
+		bw.CancelWithError(ctx, err)
 		return err
 	}
 
-	desc, err := pbs.copyContent(ctx, dgst, *bw)
+	desc, err := pbs.copyContent(ctx, dgst, bw)
 	mu.Lock()
 	inflight[dgst] = nil
 	defer mu.Unlock()
 	if err != nil {
-		(*bw).CancelWithError(ctx, err)
+		bw.CancelWithError(ctx, err)
 		dcontext.GetLogger(ctx).Errorf(" Error copying to storage: %s", err.Error())
 		return err
 	}
 
-	_, err = (*bw).Commit(ctx, desc)
+	_, err = bw.Commit(ctx, desc)
 	if err != nil {
 		dcontext.GetLogger(ctx).Errorf("Error committing to storage: %s", err.Error())
 		return err
@@ -166,15 +167,15 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 			return err
 		}
 		rw, _ := bw.(storage.ReadableWriter)
-		infl = NewBlobFetch(&rw)
+		infl = newBlobFetch(rw)
 		inflight[dgst] = infl
-		go pbs.FetchFromRemote(dgst, ctx, infl)
+		go pbs.fetchFromRemote(dgst, ctx, infl)
 	}
 
 	inflightReader := io.ReadCloser(nil)
 	var err error
 	if infl != nil {
-		inflightReader, err = (*infl.readableWriter).Reader()
+		inflightReader, err = infl.readableWriter.Reader()
 	}
 	mu.Unlock()
 	if err != nil {
