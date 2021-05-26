@@ -438,7 +438,7 @@ func (reader *blobWriterReader) Read(buff []byte) (int, error) {
 		if err != nil && err != io.EOF {
 			return count, err
 		}
-		if count != 0 && (err == nil || err == io.EOF) {
+		if count != 0 {
 			return count, nil
 		}
 		if err == io.EOF && !inProgress {
@@ -447,16 +447,16 @@ func (reader *blobWriterReader) Read(buff []byte) (int, error) {
 			}
 			return count, err
 		}
-		reader.blobWriter.mutex.Unlock()
 		if inProgress {
+			reader.blobWriter.mutex.Unlock()
 			select {
 			case <-reader.events:
 			case <-reader.finished:
 			case <-time.After(60 * time.Second):
 				logrus.Debugf("Timed out waiting for events ...")
 			}
+			reader.blobWriter.mutex.Lock()
 		}
-		reader.blobWriter.mutex.Lock()
 	}
 	return 0, io.EOF
 
