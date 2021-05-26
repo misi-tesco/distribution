@@ -27,7 +27,6 @@ type proxyBlobStore struct {
 var _ distribution.BlobStore = &proxyBlobStore{}
 
 type BlobFetch struct {
-	complete       bool
 	completeCond   *sync.Cond
 	readableWriter storage.ReadableWriter
 	mutex          sync.Mutex
@@ -126,7 +125,7 @@ func (pbs *proxyBlobStore) doFetchFromRemote(dgst digest.Digest, ctx context.Con
 
 	desc, err := pbs.copyContent(ctx, dgst, bw)
 	mu.Lock()
-	inflight[dgst] = nil
+	delete(inflight, dgst)
 	defer mu.Unlock()
 	if err != nil {
 		bw.CancelWithError(ctx, err)
@@ -156,7 +155,7 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 	isPresent := pbs.IsPresentLocally(ctx, dgst)
 
 	dcontext.GetLogger(ctx).Debugf("digest %s present: %t, in flight: %t, in flight object: %v", dgst, isPresent, ok, fetch)
-	isNew := !isPresent && !ok
+	isNew := !isPresent && (!ok || ok && !fetch.readableWriter.IsInProgress())
 	if isNew {
 		writer, err := pbs.localStore.Create(ctx)
 		if err != nil {

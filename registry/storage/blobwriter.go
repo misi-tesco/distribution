@@ -447,16 +447,16 @@ func (reader *blobWriterReader) Read(buff []byte) (int, error) {
 			}
 			return count, err
 		}
-		if inProgress {
-			reader.blobWriter.mutex.Unlock()
-			select {
-			case <-reader.events:
-			case <-reader.finished:
-			case <-time.After(60 * time.Second):
-				logrus.Debugf("Timed out waiting for events ...")
-			}
-			reader.blobWriter.mutex.Lock()
+		// At this point we have returned all the data we have available, we need to wait for
+		// further data to arrive or the download to be interrupted.
+		reader.blobWriter.mutex.Unlock()
+		select {
+		case <-reader.events:
+		case <-reader.finished:
+		case <-time.After(60 * time.Second):
+			logrus.Debugf("Timed out waiting for events ...")
 		}
+		reader.blobWriter.mutex.Lock()
 	}
 	return 0, io.EOF
 
@@ -475,6 +475,7 @@ type ReadableWriter interface {
 
 	// CancelWithError does the same as Cancel plus delegates the error to any readers that are reading the writer
 	CancelWithError(ctx context.Context, err error) error
+	IsInProgress() bool
 }
 
 func (bw *blobWriter) IsInProgress() bool {
