@@ -324,6 +324,7 @@ func (lbs *linkedBlobStore) newBlobUpload(ctx context.Context, uuid, path string
 		path:                   path,
 		mutex:                  mutex,
 		finished:               make(chan struct{}),
+		finishedClosed:         false,
 		resumableDigestEnabled: lbs.resumableDigestEnabled,
 		cancelled:              false,
 		refCount:               1,
