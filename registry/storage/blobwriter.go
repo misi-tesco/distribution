@@ -66,7 +66,7 @@ func (bw *blobWriter) StartedAt() time.Time {
 // final size and digest are checked against the first descriptor provided.
 func (bw *blobWriter) Commit(ctx context.Context, desc distribution.Descriptor) (distribution.Descriptor, error) {
 	bw.mutex.Lock()
-	defer close(bw.finished)
+	defer bw.closeFinishedChannel()
 	defer bw.mutex.Unlock()
 	res, err := bw.doCommit(ctx, desc)
 	if err != nil {
@@ -116,8 +116,8 @@ func (bw *blobWriter) doCommit(ctx context.Context, desc distribution.Descriptor
 // the writer and canceling the operation.
 func (bw *blobWriter) Cancel(ctx context.Context) error {
 	bw.mutex.Lock()
+	defer bw.closeFinishedChannel()
 	defer bw.mutex.Unlock()
-	defer close(bw.finished)
 
 	bw.cancelled = true
 	dcontext.GetLogger(ctx).Debug("(*blobWriter).Cancel")
@@ -130,6 +130,12 @@ func (bw *blobWriter) Cancel(ctx context.Context) error {
 	}
 
 	return bw.ReleaseResources()
+}
+
+func (bw *blobWriter) closeFinishedChannel() {
+	if bw.IsInProgress() {
+		close(bw.finished)
+	}
 }
 
 func (bw *blobWriter) CancelWithError(ctx context.Context, err error) error {
