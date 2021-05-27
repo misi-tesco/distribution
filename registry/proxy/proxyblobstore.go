@@ -81,18 +81,6 @@ func (pbs *proxyBlobStore) copyContent(ctx context.Context, dgst digest.Digest, 
 	return desc, nil
 }
 
-func (pbs *proxyBlobStore) serveLocal(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) (bool, error) {
-	localDesc, err := pbs.localStore.Stat(ctx, dgst)
-	if err != nil {
-		// Stat can report a zero sized file here if it's checked between creation
-		// and population.  Return nil error, and continue
-		return false, nil
-	}
-
-	proxyMetrics.BlobPush(uint64(localDesc.Size))
-	return true, pbs.localStore.ServeBlob(ctx, w, r, dgst)
-}
-
 func (pbs *proxyBlobStore) doServeFromLocalStore(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
 	_, err := pbs.localStore.Stat(ctx, dgst)
 	if err != nil {
@@ -106,7 +94,7 @@ func (pbs *proxyBlobStore) doServeFromLocalStore(ctx context.Context, w http.Res
 func (pbs *proxyBlobStore) IsPresentLocally(ctx context.Context, dgst digest.Digest) bool {
 	_, err := pbs.localStore.Stat(ctx, dgst)
 	// Stat can report a zero sized file here if it's checked between creation
-	// and population.  Return nil error, and continue
+	// and population. Continue as if it did not exist.
 	return err == nil
 }
 

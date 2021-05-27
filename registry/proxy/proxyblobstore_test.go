@@ -333,8 +333,7 @@ func TestProxyStoreServeNotFound(t *testing.T) {
 	w := httptest.NewRecorder()
 	r, err := http.NewRequest("GET", "", nil)
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatal(err)
 	}
 	err = te.store.ServeBlob(te.ctx, w, r, "sha256:1234567890123456789012345678901234567890123456789012345678901234")
 	if err != distribution.ErrBlobUnknown {
